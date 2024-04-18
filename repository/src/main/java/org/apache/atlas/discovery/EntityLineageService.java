@@ -31,8 +31,8 @@ import org.apache.atlas.model.instance.AtlasEntity.AtlasEntityWithExtInfo;
 import org.apache.atlas.model.instance.AtlasEntityHeader;
 import org.apache.atlas.model.instance.AtlasObjectId;
 import org.apache.atlas.model.lineage.AtlasLineageInfo;
-import org.apache.atlas.model.lineage.AtlasLineageInfo.LineageInfoOnDemand;
 import org.apache.atlas.model.lineage.AtlasLineageInfo.LineageDirection;
+import org.apache.atlas.model.lineage.AtlasLineageInfo.LineageInfoOnDemand;
 import org.apache.atlas.model.lineage.AtlasLineageInfo.LineageRelation;
 import org.apache.atlas.model.lineage.LineageOnDemandConstraints;
 import org.apache.atlas.repository.graphdb.AtlasEdge;
@@ -45,6 +45,7 @@ import org.apache.atlas.type.AtlasEntityType;
 import org.apache.atlas.type.AtlasTypeRegistry;
 import org.apache.atlas.type.AtlasTypeUtil;
 import org.apache.atlas.util.AtlasGremlinQueryProvider;
+import org.apache.atlas.util.CustomThreadPool;
 import org.apache.atlas.v1.model.lineage.SchemaResponse.SchemaDetails;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.collections.MapUtils;
@@ -56,28 +57,20 @@ import org.springframework.stereotype.Service;
 import javax.inject.Inject;
 import javax.script.ScriptEngine;
 import javax.script.ScriptException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.apache.atlas.AtlasClient.DATA_SET_SUPER_TYPE;
 import static org.apache.atlas.AtlasClient.PROCESS_SUPER_TYPE;
 import static org.apache.atlas.AtlasErrorCode.INSTANCE_LINEAGE_QUERY_FAILED;
-import static org.apache.atlas.model.lineage.AtlasLineageInfo.LineageDirection.BOTH;
-import static org.apache.atlas.model.lineage.AtlasLineageInfo.LineageDirection.INPUT;
-import static org.apache.atlas.model.lineage.AtlasLineageInfo.LineageDirection.OUTPUT;
+import static org.apache.atlas.model.lineage.AtlasLineageInfo.LineageDirection.*;
 import static org.apache.atlas.repository.Constants.RELATIONSHIP_GUID_PROPERTY_KEY;
 import static org.apache.atlas.repository.graphdb.AtlasEdgeDirection.IN;
 import static org.apache.atlas.repository.graphdb.AtlasEdgeDirection.OUT;
-import static org.apache.atlas.util.AtlasGremlinQueryProvider.AtlasGremlinQuery.FULL_LINEAGE_DATASET;
-import static org.apache.atlas.util.AtlasGremlinQueryProvider.AtlasGremlinQuery.FULL_LINEAGE_PROCESS;
-import static org.apache.atlas.util.AtlasGremlinQueryProvider.AtlasGremlinQuery.PARTIAL_LINEAGE_DATASET;
-import static org.apache.atlas.util.AtlasGremlinQueryProvider.AtlasGremlinQuery.PARTIAL_LINEAGE_PROCESS;
+import static org.apache.atlas.util.AtlasGremlinQueryProvider.AtlasGremlinQuery.*;
 
 @Service
 public class EntityLineageService implements AtlasLineageService {
@@ -91,6 +84,9 @@ public class EntityLineageService implements AtlasLineageService {
     private static final int     LINEAGE_ON_DEMAND_DEFAULT_DEPTH      = 3;
     private static final int     LINEAGE_ON_DEMAND_DEFAULT_NODE_COUNT = AtlasConfiguration.LINEAGE_ON_DEMAND_DEFAULT_NODE_COUNT.getInt();
     private static final String  SEPARATOR                            = "->";
+    private final CustomThreadPool executorService = CustomThreadPool.getInstance();
+    private final ReentrantLock lock = new ReentrantLock();
+
 
     private final AtlasGraph                graph;
     private final AtlasGremlinQueryProvider gremlinQueryProvider;
@@ -119,6 +115,14 @@ public class EntityLineageService implements AtlasLineageService {
         }
 
         return ret;
+    }
+
+    @Override
+    @GraphTransaction
+    public AtlasLineageInfo getAtlasLineageInfoV3(String guid, LineageDirection direction, int depth) throws AtlasBaseException {
+        boolean isDataSet = validateEntityTypeAndCheckIfDataSet(guid);
+
+        return getLineageInfoV3(guid, direction, depth, isDataSet);
     }
 
     @Override
@@ -349,6 +353,26 @@ public class EntityLineageService implements AtlasLineageService {
         return ret;
     }
 
+    private AtlasLineageInfo getLineageInfoV3(String guid, LineageDirection direction, int depth, boolean isDataSet) throws AtlasBaseException {
+        AtlasLineageInfo ret = initializeLineageInfo(guid, direction, depth);
+
+        if (depth == 0) {
+            depth = -1;
+        }
+
+        AtlasVertex datasetVertex = AtlasGraphUtilsV2.findByGuid(this.graph, guid);
+
+        if (direction == INPUT || direction == BOTH) {
+            traverseEdgesV3(datasetVertex, true, depth, ret);
+        }
+
+        if (direction == OUTPUT || direction == BOTH) {
+            traverseEdgesV3(datasetVertex, false, depth, ret);
+        }
+
+        return ret;
+    }
+
     private LineageOnDemandConstraints getDefaultLineageConstraints(String guid) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("No lineage on-demand constraints provided for guid: {}, configuring with default values direction: {}, inputRelationsLimit: {}, outputRelationsLimit: {}, depth: {}",
@@ -476,6 +500,77 @@ public class EntityLineageService implements AtlasLineageService {
         }
     }
 
+    private void traverseEdgesV3(AtlasVertex datasetVertex, boolean isInput, int depth, AtlasLineageInfo ret) throws AtlasBaseException {
+        traverseEdgesV3(datasetVertex, isInput, depth, new HashSet<>(), ret);
+    }
+
+    private void traverseEdgesV3(AtlasVertex datasetVertex, boolean isInput, int depth, Set<String> visitedVertices, AtlasLineageInfo ret) throws AtlasBaseException {
+        if (depth == 0) {
+            return;
+        }
+
+        Deque<AtlasVertex> stack = new ArrayDeque<>();
+        stack.push(datasetVertex);
+
+        while (!stack.isEmpty()) {
+            AtlasVertex currentVertex = stack.pop();
+
+            visitedVertices.add(getId(currentVertex));
+
+            Iterable<AtlasEdge> incomingEdges = currentVertex.getEdges(IN, isInput ? PROCESS_OUTPUTS_EDGE : PROCESS_INPUTS_EDGE);
+
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+            for (AtlasEdge incomingEdge : incomingEdges) {
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    long threadId = Thread.currentThread().getId();
+                    AtlasVertex processVertex = incomingEdge.getOutVertex();
+                    LOG.debug("Task started on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                    String typeName = processVertex.getProperty("__typeName", String.class);
+                    if (!StringUtils.equalsIgnoreCase(typeName, "hive_process")) {
+                        LOG.debug("Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                        return;
+                    }
+
+                    Iterable<AtlasEdge> outgoingEdges = processVertex.getEdges(OUT, isInput ? PROCESS_INPUTS_EDGE : PROCESS_OUTPUTS_EDGE);
+                    LOG.debug("获取outgoingEdges成功，Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+
+                    for (AtlasEdge outgoingEdge : outgoingEdges) {
+                        AtlasVertex entityVertex = outgoingEdge.getInVertex();
+
+                        if (entityVertex != null && !visitedVertices.contains(getId(entityVertex))) {
+                            stack.push(entityVertex);
+                            visitedVertices.add(getId(entityVertex));
+                        }
+
+                        LOG.debug("开始获取锁：incomingEdge，Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                        lock.lock();
+                        try {
+                            LOG.debug("开始执行addEdgeToResult：incomingEdge，Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                            addEdgeToResult(incomingEdge, ret);
+                            LOG.debug("开始执行addEdgeToResult：outgoingEdge，Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                            addEdgeToResult(outgoingEdge, ret);
+                        } catch (AtlasBaseException e) {
+                            throw new RuntimeException(e);
+                        } finally {
+                            LOG.debug("开始释放锁：outgoingEdge，Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                            lock.unlock();
+                        }
+                    }
+                    LOG.debug("Task finished on thread ID: {}, processVertex: {}", threadId, processVertex.getProperty("__guid", String.class));
+                }, executorService.getExecutor());
+                futures.add(future);
+            }
+
+            CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+
+            try {
+                allOf.get();
+            } catch (InterruptedException | ExecutionException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
     private void traverseEdgesOnDemand(Iterable<AtlasEdge> processEdges, boolean isInput, int depth, Map<String, LineageOnDemandConstraints> lineageConstraintsMap, AtlasLineageInfo ret) throws AtlasBaseException {
         for (AtlasEdge processEdge : processEdges) {
             boolean isInputEdge  = processEdge.getLabel().equalsIgnoreCase(PROCESS_INPUTS_EDGE);
@@ -721,5 +816,15 @@ public class EntityLineageService implements AtlasLineageService {
 
     public boolean isLineageOnDemandEnabled() {
         return AtlasConfiguration.LINEAGE_ON_DEMAND_ENABLED.getBoolean();
+    }
+
+    class TraversalStep {
+        final AtlasVertex vertex;
+        final boolean isInput;
+
+        public TraversalStep(AtlasVertex vertex, boolean isInput) {
+            this.vertex = vertex;
+            this.isInput = isInput;
+        }
     }
 }

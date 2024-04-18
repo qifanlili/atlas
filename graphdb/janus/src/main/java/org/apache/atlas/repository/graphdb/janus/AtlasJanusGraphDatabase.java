@@ -115,6 +115,8 @@ public class AtlasJanusGraphDatabase implements GraphDatabase<AtlasJanusVertex, 
 
         janusConfig.setProperty("attributes.custom.attribute4.attribute-class", BigDecimal.class.getName());
         janusConfig.setProperty("attributes.custom.attribute4.serializer-class", BigDecimalSerializer.class.getName());
+        janusConfig.setProperty("query.batch", true);
+        janusConfig.setProperty("query.batch-property-prefetch", true);
 
         return janusConfig;
     }

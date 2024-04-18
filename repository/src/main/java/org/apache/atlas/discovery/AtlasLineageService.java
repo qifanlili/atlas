@@ -36,6 +36,8 @@ public interface AtlasLineageService {
      */
     AtlasLineageInfo getAtlasLineageInfo(String entityGuid, LineageDirection direction, int depth) throws AtlasBaseException;
 
+    AtlasLineageInfo getAtlasLineageInfoV3(String entityGuid, LineageDirection direction, int depth) throws AtlasBaseException;
+
     /**
      * @param entityGuid unique ID of the entity
      * @param lineageOnDemandConstraintsByGuid map of constraints to fetch lineage for each guid

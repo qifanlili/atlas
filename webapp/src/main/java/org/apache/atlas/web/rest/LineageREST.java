@@ -41,14 +41,7 @@ import org.springframework.stereotype.Service;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.servlet.http.HttpServletRequest;
-import javax.ws.rs.Consumes;
-import javax.ws.rs.DefaultValue;
-import javax.ws.rs.GET;
-import javax.ws.rs.Path;
-import javax.ws.rs.PathParam;
-import javax.ws.rs.POST;
-import javax.ws.rs.Produces;
-import javax.ws.rs.QueryParam;
+import javax.ws.rs.*;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import java.util.HashMap;
@@ -190,6 +183,32 @@ public class LineageREST {
             }
 
             return atlasLineageService.getAtlasLineageInfo(guid, direction, depth);
+        } finally {
+            AtlasPerfTracer.log(perf);
+        }
+    }
+
+    @GET
+    @Path("/uniqueAttributeV2/type/{typeName}")
+    @Consumes(Servlets.JSON_MEDIA_TYPE)
+    @Produces(Servlets.JSON_MEDIA_TYPE)
+    @Timed
+    public AtlasLineageInfo getLineageByUniqueAttributeV2(@PathParam("typeName") String typeName, @QueryParam("direction") @DefaultValue(DEFAULT_DIRECTION) LineageDirection direction,
+                                                            @QueryParam("depth") @DefaultValue(DEFAULT_DEPTH) int depth, @Context HttpServletRequest servletRequest) throws AtlasBaseException {
+        Servlets.validateQueryParamLength("typeName", typeName);
+        AtlasPerfTracer perf = null;
+
+        try {
+            AtlasEntityType entityType = ensureEntityType(typeName);
+            Map<String, Object> attributes = getAttributes(servletRequest);
+            String guid = AtlasGraphUtilsV2.getGuidByUniqueAttributes(entityType, attributes);
+
+            if (AtlasPerfTracer.isPerfTraceEnabled(PERF_LOG)) {
+                perf = AtlasPerfTracer.getPerfTracer(PERF_LOG, "LineageREST.getLineageByUniqueAttribute(" + typeName + "," + attributes + "," + direction +
+                        "," + depth + ")");
+            }
+
+            return atlasLineageService.getAtlasLineageInfoV3(guid, direction, depth);
         } finally {
             AtlasPerfTracer.log(perf);
         }

@@ -19,6 +19,7 @@
 package org.apache.atlas;
 
 import org.apache.atlas.security.SecurityProperties;
+import org.apache.atlas.util.CustomThreadPool;
 import org.apache.atlas.web.service.EmbeddedServer;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
@@ -59,6 +60,15 @@ public final class Atlas {
         ShutdownHookManager.get().addShutdownHook(new Thread() {
             @Override
             public void run() {
+                try {
+                    LOG.info("==> Shutdown of CustomThreadPool");
+
+                    CustomThreadPool.getInstance().shutdown();
+                } catch (Exception e) {
+                    LOG.error("Failed to shutdown CustomThreadPool", e);
+                } finally {
+                    LOG.info("<== Shutdown of CustomThreadPool");
+                }
                 try {
                     LOG.info("==> Shutdown of Atlas");
 
